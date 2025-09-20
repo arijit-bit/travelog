@@ -1,98 +1,451 @@
-import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import React, { useEffect, useState, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Alert,
+  SafeAreaView,
+} from 'react-native';
+import MapView, { Polyline } from 'react-native-maps';
+import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { HelloWave } from '@/components/hello-wave';
-import ParallaxScrollView from '@/components/parallax-scroll-view';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+// Types
+interface LocationCoords {
+  latitude: number;
+  longitude: number;
+  timestamp: number;
+  speed?: number;
+}
 
-export default function HomeScreen() {
+type TransportMode ='stationary'| 'walking' | 'running' | 'bike' | 'car' | 'plane';
+
+interface Trip {
+  id: string;
+  startTime: number;
+  endTime: number;
+  path: LocationCoords[];
+  distance: number;
+  duration: number;
+  averageSpeed: number;
+  transportMode: TransportMode;
+}
+
+// Transport mode detection based on speed (m/s)
+const TRANSPORT_MODES = {
+  stationary: { maxSpeed: 0.3, emoji: '🧍', name: 'Stationary' }, // < 1 km/h
+  walking: { maxSpeed: 1.4, emoji: '🚶', name: 'Walking' },    // < 5 km/h
+  running: { maxSpeed: 4.2, emoji: '🏃', name: 'Running' },    // 5-15 km/h
+  bike: { maxSpeed: 8.3, emoji: '🚴', name: 'Biking' },        // 15-30 km/h
+  car: { maxSpeed: 33.3, emoji: '🚗', name: 'Driving' },       // 30-120 km/h
+  plane: { maxSpeed: Infinity, emoji: '✈️', name: 'Flying' },  // > 120 km/h
+};
+
+const getTransportMode = (speedMs: number): TransportMode => {
+  if (speedMs <= TRANSPORT_MODES.stationary.maxSpeed) return 'stationary';
+  if (speedMs <= TRANSPORT_MODES.walking.maxSpeed) return 'walking';
+  if (speedMs <= TRANSPORT_MODES.running.maxSpeed) return 'running';
+  if (speedMs <= TRANSPORT_MODES.bike.maxSpeed) return 'bike';
+  if (speedMs <= TRANSPORT_MODES.car.maxSpeed) return 'car';
+  return 'plane';
+};
+
+export default function TripTrackerScreen() {
+  const [location, setLocation] = useState<Location.LocationObject | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isTracking, setIsTracking] = useState(false);
+  const [currentPath, setCurrentPath] = useState<LocationCoords[]>([]);
+  const [speed, setSpeed] = useState(0);
+  const [tripStartTime, setTripStartTime] = useState<number | null>(null);
+  const [distance, setDistance] = useState(0);
+  const [currentTransportMode, setCurrentTransportMode] = useState<TransportMode>('stationary');
+
+  const mapRef = useRef<MapView | null>(null);
+  const locationWatcher = useRef<Location.LocationSubscription | null>(null);
+  
+  // ✅ FIX: Use a ref to track the current tracking state
+  const isTrackingRef = useRef(false);
+
+  // Calculate distance between two coordinates
+  const calculateDistance = (coord1: LocationCoords, coord2: LocationCoords): number => {
+    const R = 6371e3; // Earth's radius in meters
+    const φ1 = (coord1.latitude * Math.PI) / 180;
+    const φ2 = (coord2.latitude * Math.PI) / 180;
+    const Δφ = ((coord2.latitude - coord1.latitude) * Math.PI) / 180;
+    const Δλ = ((coord2.longitude - coord1.longitude) * Math.PI) / 180;
+
+    const a =
+      Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+      Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    return R * c;
+  };
+
+  // Start location tracking
+  const startLocationTracking = async () => {
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== 'granted') {
+      setErrorMsg('Permission to access location was denied');
+      return;
+    }
+
+    locationWatcher.current = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.BestForNavigation,
+        timeInterval: 1000, // every 1 sec
+        distanceInterval: 1, // every 1 meter
+      },
+      (loc) => {
+        setLocation(loc);
+
+        // ✅ FIX: Use the ref value instead of state
+        if (isTrackingRef.current) {
+          const newPoint: LocationCoords = {
+            latitude: loc.coords.latitude,
+            longitude: loc.coords.longitude,
+            timestamp: loc.timestamp,
+            speed: loc.coords.speed || 0,
+          };
+
+          setCurrentPath(prev => {
+            if (prev.length > 0) {
+              const lastPoint = prev[prev.length - 1];
+              const distanceIncrement = calculateDistance(lastPoint, newPoint);
+              const timeDiff = (newPoint.timestamp - lastPoint.timestamp) / 1000;
+
+              // Update distance
+              setDistance(prevDistance => prevDistance + distanceIncrement);
+
+              // Calculate speed (m/s) or use GPS speed
+              if (timeDiff > 0 && distanceIncrement > 0.5) { // Only update if moved at least 0.5m
+                const calculatedSpeed = distanceIncrement / timeDiff;
+                setSpeed(calculatedSpeed);
+                setCurrentTransportMode(getTransportMode(calculatedSpeed));
+              } else if (loc.coords.speed !== null && loc.coords.speed !== undefined) {
+                // Use GPS speed as fallback
+                const gpsSpeed = Math.max(0, loc.coords.speed);
+                setSpeed(gpsSpeed);
+                setCurrentTransportMode(getTransportMode(gpsSpeed));
+              }
+            } else if (loc.coords.speed !== null && loc.coords.speed !== undefined) {
+              // Set initial speed from GPS if available
+              const gpsSpeed = Math.max(0, loc.coords.speed);
+              setSpeed(gpsSpeed);
+              setCurrentTransportMode(getTransportMode(gpsSpeed));
+            }
+            return [...prev, newPoint];
+          });
+        }
+      }
+    );
+  };
+
+  // Start trip tracking
+  const startTrip = () => {
+    if (!location) {
+      Alert.alert('Error', 'Location not available yet');
+      return;
+    }
+
+    // ✅ FIX: Update both state and ref
+    setIsTracking(true);
+    isTrackingRef.current = true;
+    
+    setTripStartTime(Date.now());
+    setCurrentPath([{
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude,
+      timestamp: location.timestamp,
+      speed: location.coords.speed ? Math.max(0, location.coords.speed) : 0,
+    }]);
+    setDistance(0);
+    setSpeed(location.coords.speed ? Math.max(0, location.coords.speed) : 0);
+  };
+
+  // Stop trip tracking and save
+  const stopTrip = async () => {
+    if (!isTracking || !tripStartTime) return;
+
+    // ✅ FIX: Update both state and ref
+    setIsTracking(false);
+    isTrackingRef.current = false;
+    
+    const endTime = Date.now();
+    const duration = (endTime - tripStartTime) / 1000; // in seconds
+    const averageSpeed = duration > 0 ? distance / duration : 0;
+    const transportMode = getTransportMode(averageSpeed);
+
+    const trip: Trip = {
+      id: Date.now().toString(),
+      startTime: tripStartTime,
+      endTime,
+      path: currentPath,
+      distance,
+      duration,
+      averageSpeed,
+      transportMode,
+    };
+
+    try {
+      // Save trip to AsyncStorage
+      const existingTrips = await AsyncStorage.getItem('trips');
+      const trips = existingTrips ? JSON.parse(existingTrips) : [];
+      trips.push(trip);
+      await AsyncStorage.setItem('trips', JSON.stringify(trips));
+
+      const modeInfo = TRANSPORT_MODES[transportMode];
+      Alert.alert(
+        'Trip Saved!',
+        `${modeInfo.emoji} Mode: ${modeInfo.name}\nDistance: ${(distance / 1000).toFixed(2)} km\nDuration: ${formatDuration(duration)}\nAvg Speed: ${(averageSpeed * 3.6).toFixed(1)} km/h`
+      );
+    } catch (error) {
+      console.error('Error saving trip:', error);
+      Alert.alert('Error', 'Failed to save trip');
+    }
+
+    // Reset state
+    setCurrentPath([]);
+    setTripStartTime(null);
+    setDistance(0);
+    setSpeed(0);
+    setCurrentTransportMode('stationary');
+  };
+
+  // Format duration
+  const formatDuration = (seconds: number): string => {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${secs}s`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${secs}s`;
+    } else {
+      return `${secs}s`;
+    }
+  };
+
+  // Format speed
+  const getFormattedSpeed = () => {
+    if (speed < 0.1) {
+      return '0.0 km/h';
+    }
+    return `${(speed * 3.6).toFixed(1)} km/h`;
+  };
+
+  // Initialize location tracking
+  useEffect(() => {
+    startLocationTracking();
+
+    return () => {
+      if (locationWatcher.current) {
+        locationWatcher.current.remove();
+      }
+    };
+  }, []);
+
+  if (errorMsg) {
+    return (
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.errorText}>{errorMsg}</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (!location) {
+    return (
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.loadingText}>Getting your location...</Text>
+      </SafeAreaView>
+    );
+  }
+
   return (
-    <ParallaxScrollView
-      headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
-      headerImage={
-        <Image
-          source={require('@/assets/images/partial-react-logo.png')}
-          style={styles.reactLogo}
-        />
-      }>
-      <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
-        <HelloWave />
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 1: Try it</ThemedText>
-        <ThemedText>
-          Edit <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> to see changes.
-          Press{' '}
-          <ThemedText type="defaultSemiBold">
-            {Platform.select({
-              ios: 'cmd + d',
-              android: 'cmd + m',
-              web: 'F12',
-            })}
-          </ThemedText>{' '}
-          to open developer tools.
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <Link href="/modal">
-          <Link.Trigger>
-            <ThemedText type="subtitle">Step 2: Explore</ThemedText>
-          </Link.Trigger>
-          <Link.Preview />
-          <Link.Menu>
-            <Link.MenuAction title="Action" icon="cube" onPress={() => alert('Action pressed')} />
-            <Link.MenuAction
-              title="Share"
-              icon="square.and.arrow.up"
-              onPress={() => alert('Share pressed')}
-            />
-            <Link.Menu title="More" icon="ellipsis">
-              <Link.MenuAction
-                title="Delete"
-                icon="trash"
-                destructive
-                onPress={() => alert('Delete pressed')}
-              />
-            </Link.Menu>
-          </Link.Menu>
-        </Link>
+    <SafeAreaView style={styles.container}>
+      {/* Control Button */}
+      <View style={styles.buttonContainer}>
+        <TouchableOpacity
+          style={[
+            styles.controlButton,
+            isTracking ? styles.stopButton : styles.startButton,
+          ]}
+          onPress={isTracking ? stopTrip : startTrip}
+        >
+          <Text style={styles.buttonText}>
+            {isTracking ? '🛑 Stop Tracking' : '🚀 Start Tracking'}
+          </Text>
+        </TouchableOpacity>
+      </View>
 
-        <ThemedText>
-          {`Tap the Explore tab to learn more about what's included in this starter app.`}
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 3: Get a fresh start</ThemedText>
-        <ThemedText>
-          {`When you're ready, run `}
-          <ThemedText type="defaultSemiBold">npm run reset-project</ThemedText> to get a fresh{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> directory. This will move the current{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> to{' '}
-          <ThemedText type="defaultSemiBold">app-example</ThemedText>.
-        </ThemedText>
-      </ThemedView>
-    </ParallaxScrollView>
+      {/* Map */}
+      <MapView
+        ref={mapRef}
+        style={styles.map}
+        region={{
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          latitudeDelta: 0.005,
+          longitudeDelta: 0.005,
+        }}
+        showsUserLocation
+        followsUserLocation
+      >
+        {/* Draw path if tracking */}
+        {currentPath.length > 1 && (
+          <Polyline
+            coordinates={currentPath.map(point => ({
+              latitude: point.latitude,
+              longitude: point.longitude,
+            }))}
+            strokeColor="#007AFF"
+            strokeWidth={4}
+            lineCap="round"
+            lineJoin="round"
+          />
+        )}
+      </MapView>
+
+      {/* Info Overlay */}
+      <View style={styles.overlay}>
+        <Text style={styles.statusText}>
+          {isTracking ? '🟢 Tracking Active' : '🔴 Not Tracking'}
+        </Text>
+        
+        {/* Transport Mode Display */}
+        {isTracking && (
+          <View style={styles.transportModeContainer}>
+            <Text style={styles.transportModeText}>
+              {TRANSPORT_MODES[currentTransportMode].emoji} {TRANSPORT_MODES[currentTransportMode].name}
+            </Text>
+          </View>
+        )}
+        
+        <Text style={styles.text}>Speed: {getFormattedSpeed()}</Text>
+        {isTracking && (
+          <>
+            <Text style={styles.text}>
+              Distance: {(distance / 1000).toFixed(2)} km
+            </Text>
+            <Text style={styles.text}>
+              Duration: {tripStartTime ? formatDuration((Date.now() - tripStartTime) / 1000) : '0s'}
+            </Text>
+            <Text style={styles.text}>
+              Points: {currentPath.length}
+            </Text>
+            {currentPath.length === 1 && (
+              <Text style={styles.smallText}>
+                Move to start recording distance...
+              </Text>
+            )}
+          </>
+        )}
+      </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  titleContainer: {
-    flexDirection: 'row',
+  container: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+  },
+  map: {
+    flex: 1,
+  },
+  center: {
+    flex: 1,
     alignItems: 'center',
-    gap: 8,
+    justifyContent: 'center',
+    padding: 20,
   },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 8,
+  errorText: {
+    color: 'red',
+    fontSize: 16,
+    textAlign: 'center',
   },
-  reactLogo: {
-    height: 178,
-    width: 290,
-    bottom: 0,
-    left: 0,
+  loadingText: {
+    color: '#666',
+    fontSize: 16,
+    textAlign: 'center',
+  },
+  buttonContainer: {
     position: 'absolute',
+    top: 60,
+    left: 20,
+    right: 20,
+    zIndex: 1000,
+  },
+  controlButton: {
+    paddingVertical: 15,
+    paddingHorizontal: 30,
+    borderRadius: 25,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  startButton: {
+    backgroundColor: '#4CAF50',
+  },
+  stopButton: {
+    backgroundColor: '#f44336',
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  overlay: {
+    position: 'absolute',
+    bottom: 50,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    padding: 20,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+  },
+  statusText: {
+    color: 'white',
+    fontSize: 20,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  text: {
+    color: 'white',
+    fontSize: 16,
+    textAlign: 'center',
+    marginVertical: 3,
+  },
+  smallText: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
+    marginTop: 5,
+    fontStyle: 'italic',
+  },
+  transportModeContainer: {
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    marginBottom: 10,
+    alignSelf: 'center',
+  },
+  transportModeText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: '600',
+    textAlign: 'center',
   },
 });

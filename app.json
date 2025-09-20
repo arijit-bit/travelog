@@ -1,5 +1,8 @@
 {
   "expo": {
+    "extra": {
+      "googleMapsApiKey": "AIzaSyAbAAf-HXJ26PQKAsoO8a6C66wiDHe8x-w"
+    },
     "name": "trip-tracker",
     "slug": "trip-tracker",
     "version": "1.0.0",
