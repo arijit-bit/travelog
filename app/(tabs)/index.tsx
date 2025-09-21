@@ -351,6 +351,7 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#f5f5f5',
+    paddingBottom: 30, // added bottom padding
   },
   map: {
     flex: 1,
@@ -405,7 +406,7 @@ const styles = StyleSheet.create({
   },
   overlay: {
     position: 'absolute',
-    bottom: 50,
+    bottom: 70, // increased bottom spacing
     left: 20,
     right: 20,
     backgroundColor: 'rgba(0,0,0,0.8)',
